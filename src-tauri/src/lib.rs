@@ -311,6 +311,22 @@ fn cursor_pos_for(_win: &WebviewWindow) -> Option<(f64, f64)> {
     None
 }
 
+// Is the primary mouse button physically held right now? VK_LBUTTON tracks the
+// physical button (so it also works when the OS swaps buttons for a left-handed
+// mouse). A native window drag (startDragging → WM_NCLBUTTONDOWN/HTCAPTION) runs a
+// modal move loop while the button stays down; we use this to keep the click-through
+// poll from changing state underneath it.
+#[cfg(windows)]
+fn primary_mouse_button_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+    unsafe { (GetAsyncKeyState(VK_LBUTTON as i32) as i16) < 0 }
+}
+
+#[cfg(not(windows))]
+fn primary_mouse_button_down() -> bool {
+    false
+}
+
 fn start_hit_test_loop(
     app: AppHandle,
     settings: Arc<Mutex<AppSettings>>,
@@ -332,6 +348,17 @@ fn start_hit_test_loop(
                 sleep_ms = 120;
                 continue;
             }
+            // While the primary mouse button is held (a pet drag in progress, or any drag
+            // passing over the pet) do NOT recompute the click-through state. If the poll
+            // flips WS_EX_TRANSPARENT mid-drag the window is pulled out from under the
+            // cursor and the native move loop is cancelled, so the window never moves.
+            // This is the classic trigger when dragging across a mixed-DPI monitor seam:
+            // outer_position / scale can read inconsistently for a frame, making `inside`
+            // look false and the window suddenly turn click-through.
+            if dragging.load(Ordering::Relaxed) || primary_mouse_button_down() {
+                sleep_ms = 20;
+                continue;
+            }
             let Some((cx, cy)) = cursor_pos_for(&win) else {
                 sleep_ms = 50;
                 continue;
@@ -346,7 +373,6 @@ fn start_hit_test_loop(
             let rx = (cx - px as f64) / w;
             let ry = (cy - py as f64) / h;
             let inside = rx >= 0.0 && rx <= 1.0 && ry >= 0.0 && ry <= 1.0;
-            let forced = dragging.load(Ordering::Relaxed);
 
             let locked = settings
                 .lock()
@@ -354,9 +380,7 @@ fn start_hit_test_loop(
                 .unwrap_or(false);
             let effective_locked = locked && !input_hook::is_alt_pressed();
 
-            let over = if forced {
-                true
-            } else if effective_locked || !inside {
+            let over = if effective_locked || !inside {
                 false
             } else {
                 regions
@@ -385,7 +409,7 @@ fn start_hit_test_loop(
             // Poll fast only while the cursor is at or near the cat; a resting cursor
             // elsewhere does not need 40 wakeups per second.
             let near = rx >= -0.15 && rx <= 1.15 && ry >= -0.15 && ry <= 1.15;
-            sleep_ms = if forced || near { 25 } else { 50 };
+            sleep_ms = if near { 25 } else { 50 };
         }
     });
 }
